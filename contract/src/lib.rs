@@ -30,6 +30,7 @@ pub enum RegistryError {
     CategoryIndexNotFound = 9,
     InvalidEndpoint = 10,
     InvalidCategory = 11,
+    ServiceCounterNotFound = 12,
 }
 
 // Canonical category list. Keep in sync with `frontend/lib/categoryMeta.tsx`.
@@ -123,6 +124,41 @@ impl LodestarRegistry {
     /// Deploy-time setup: store the address of the LodestarAgents contract so
     /// `update_reputation` can verify voters are registered agents.
     ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment used to access contract storage.
+    /// * `agents_contract` - Address of the LodestarAgents contract that
+    ///   `update_reputation` will cross-call (`is_registered`) to authorise
+    ///   reputation voters. Stored verbatim; not validated at construction time.
+    ///
+    /// # Returns
+    ///
+    /// This function returns `()`. Its only observable effect is the storage
+    /// write described below.
+    ///
+    /// # Authorisation
+    ///
+    /// This is a contract constructor. It runs exactly once, atomically, as part
+    /// of deployment, and can never be invoked by a later caller. It therefore
+    /// requires no `require_auth` and exposes no post-deploy setter: the agents
+    /// address is fixed for the contract's lifetime. That closes the
+    /// trust-anchor takeover risk a public `init` would carry (a front-runner
+    /// pointing the registry at a malicious agents contract where everyone is
+    /// "registered").
+    ///
+    /// # Panics
+    ///
+    /// This function defines no contract-specific panic path and returns no
+    /// `RegistryError` variant. The Soroban SDK will panic, without a
+    /// `RegistryError` variant, if the persistent-storage write or TTL extension
+    /// fails (for example, if the host rejects the storage access).
+    ///
+    /// # Storage
+    ///
+    /// * `DataKey::AgentsContract` — written with the supplied `agents_contract`
+    ///   address, then its TTL is extended by `MAX_TTL` ledgers (both threshold
+    ///   and extend-to), so the trust anchor does not expire.
+    ///
     /// This is a contract constructor — it runs exactly once, atomically, as part
     /// of deployment, and can never be invoked by a later caller. That closes the
     /// trust-anchor takeover risk a public `init` would carry (a front-runner
@@ -139,7 +175,16 @@ impl LodestarRegistry {
 
     /// Address of the LodestarAgents contract this registry was deployed against.
     pub fn get_agents_contract(env: Env) -> Option<Address> {
-        env.storage().persistent().get(&DataKey::AgentsContract)
+        // Storage keys touched by this function:
+        // 1. DataKey::AgentsContract - read to return the contract address;
+        //    TTL extended so the trust anchor is not archived.
+        let result = env.storage().persistent().get(&DataKey::AgentsContract);
+        if result.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::AgentsContract, MAX_TTL, MAX_TTL);
+        }
+        result
     }
 
     pub fn register_service(
@@ -261,6 +306,32 @@ impl LodestarRegistry {
         Ok(new_id)
     }
 
+    /// Returns the service registered under `id`.
+    ///
+    /// This read-only entrypoint calls `get` once for the persistent-storage key
+    /// `DataKey::Service(id)`. It does not require authorization, extend the
+    /// entry's TTL, write to storage, emit an event, or call another contract.
+    /// An entry is returned unchanged when present, including when it is
+    /// inactive.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment used to access contract storage.
+    /// * `id` - The registry identifier of the service to retrieve.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(ServiceEntry)` when `DataKey::Service(id)` has a live value, or
+    /// `Err(RegistryError::ServiceNotFound)` when no live value is stored at
+    /// that key.
+    ///
+    /// # Panics
+    ///
+    /// This function defines no contract-specific panic path. The Soroban SDK
+    /// will panic, without a `RegistryError` variant, if a stored value cannot
+    /// be converted to `ServiceEntry`; values written by this contract preserve
+    /// that type invariant. A missing live value returns `ServiceNotFound`
+    /// instead of panicking.
     pub fn get_service(env: Env, id: u64) -> Result<ServiceEntry, RegistryError> {
         env.storage()
             .persistent()
@@ -443,6 +514,19 @@ impl LodestarRegistry {
 
     /// Cast a reputation vote on a service.
     ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment used to access contract storage.
+    /// * `id` - The registry identifier of the service to vote on.
+    /// * `positive` - `true` to increase the service's reputation, `false` to decrease it.
+    /// * `caller` - The address of the agent casting the vote.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` when the vote is successfully applied.
+    ///
+    /// # Authorization
+    ///
     /// Authorization (closes the anonymous-write vulnerability):
     /// 1. `caller.require_auth()` — the vote must be signed by `caller`.
     /// 2. `caller` must be a registered agent, checked via a cross-contract
@@ -451,6 +535,25 @@ impl LodestarRegistry {
     /// 3. A per-(service, agent) cooldown of `VOTE_COOLDOWN_LEDGERS` rate-limits
     ///    repeat votes, preventing a single identity from inflating or tanking a
     ///    score in a tight loop.
+    ///
+    /// # Panics
+    ///
+    /// This function returns the following `RegistryError` variants on failure:
+    /// * `RegistryError::AgentsContractNotConfigured` - when the agents contract address is not configured.
+    /// * `RegistryError::CallerNotRegisteredAgent` - when `caller` is not a registered agent.
+    /// * `RegistryError::ServiceNotFound` - when no service exists with the given `id`.
+    /// * `RegistryError::ReputationVoteCooldown` - when the caller has voted on this service too recently.
+    ///
+    /// The Soroban SDK will panic, without a `RegistryError` variant, if stored values cannot be
+    /// converted to their expected types.
+    ///
+    /// # Storage
+    ///
+    /// Storage keys touched by this function:
+    /// 1. `DataKey::AgentsContract` — read to resolve the agents contract; TTL extended.
+    /// 2. `DataKey::Service(id)` — read, updated, and TTL extended.
+    /// 3. `DataKey::LastVote(id, caller)` — read for the cooldown check, written
+    ///    with the current ledger, and TTL extended.
     pub fn update_reputation(
         env: Env,
         id: u64,
@@ -465,6 +568,9 @@ impl LodestarRegistry {
             .persistent()
             .get(&DataKey::AgentsContract)
             .ok_or(RegistryError::AgentsContractNotConfigured)?;
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::AgentsContract, MAX_TTL, MAX_TTL);
 
         let registered: bool = env.invoke_contract(
             &agents_contract,
@@ -480,11 +586,17 @@ impl LodestarRegistry {
             .persistent()
             .get(&DataKey::Service(id))
             .ok_or(RegistryError::ServiceNotFound)?;
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Service(id), MAX_TTL, MAX_TTL);
 
         // ── 2. Per-(service, agent) cooldown ──────────────────────────────────
         let now = env.ledger().sequence() as u64;
         let vote_key = DataKey::LastVote(id, caller.clone());
         if let Some(last_vote) = env.storage().persistent().get::<DataKey, u64>(&vote_key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&vote_key, MAX_TTL, MAX_TTL);
             if now < last_vote + VOTE_COOLDOWN_LEDGERS {
                 return Err(RegistryError::ReputationVoteCooldown);
             }
@@ -596,7 +708,9 @@ impl LodestarRegistry {
             .storage()
             .persistent()
             .get(&DataKey::Service(id))
-            .unwrap_or_else(|| soroban_sdk::panic_with_error!(&env, RegistryError::ServiceNotFound));
+            .unwrap_or_else(|| {
+                soroban_sdk::panic_with_error!(&env, RegistryError::ServiceNotFound)
+            });
 
         if provider != entry.provider {
             soroban_sdk::panic_with_error!(&env, RegistryError::ProviderMismatch);
@@ -1229,8 +1343,7 @@ mod test {
         assert_eq!(all.len(), 1);
         assert_eq!(all.get(0).unwrap().id, 1);
 
-        let by_category =
-            registry.list_services(&0, &20, &Some(String::from_str(&env, "compute")));
+        let by_category = registry.list_services(&0, &20, &Some(String::from_str(&env, "compute")));
         assert_eq!(by_category.len(), 1);
         assert_eq!(by_category.get(0).unwrap().id, 1);
 
@@ -1435,7 +1548,7 @@ mod test {
         });
 
         let result = registry.try_reactivate_service(&other, &1);
-        assert!(matches!(result, Err(Ok(soroban_sdk::Error::from_contract_error(8)))));
+        assert_eq!(result, Err(Ok(soroban_sdk::Error::from_contract_error(8))));
         let service = registry.get_service(&1);
         assert!(!service.active);
         assert_eq!(service.reputation, 42);
@@ -1450,7 +1563,7 @@ mod test {
         let provider = Address::generate(&env);
 
         let result = registry.try_reactivate_service(&provider, &999);
-        assert!(matches!(result, Err(Ok(soroban_sdk::Error::from_contract_error(4)))));
+        assert_eq!(result, Err(Ok(soroban_sdk::Error::from_contract_error(4))));
     }
 
     #[test]
@@ -1463,12 +1576,12 @@ mod test {
 
         env.clone().as_contract(&contract_id, || {
             setup_service(&env, 1, &provider, "compute", 42, false); // Deactivated
-            setup_service(&env, 2, &provider, "compute", 42, true);  // Active duplicate (same provider, endpoint)
+            setup_service(&env, 2, &provider, "compute", 42, true); // Active duplicate (same provider, endpoint)
         });
 
         // Try to reactivate the first one, it should fail with DuplicateActiveService (3)
         let result = registry.try_reactivate_service(&provider, &1);
-        assert!(matches!(result, Err(Ok(soroban_sdk::Error::from_contract_error(3)))));
+        assert_eq!(result, Err(Ok(soroban_sdk::Error::from_contract_error(3))));
     }
     // Minimal stand-in for the LodestarAgents contract exposing just the
     // `is_registered` entrypoint the registry cross-calls.
@@ -1677,8 +1790,9 @@ mod test {
         );
 
         // Advance ledger by somewhat less than MAX_TTL
-        env.ledger().with_mut(|li| li.sequence_number += 3110400 - 100);
-        
+        env.ledger()
+            .with_mut(|li| li.sequence_number += 3110400 - 100);
+
         // This should bump the TTL again
         registry.deactivate_service(&provider, &id);
 
@@ -1692,36 +1806,39 @@ mod test {
         assert_eq!(entry.active, false);
     }
 
+    /// `set_registered` on the agents contract is exercised through the
+    /// registry's `update_reputation` path. Every persistent key touched by
+    /// `update_reputation` must have its TTL extended, otherwise an entry can
+    /// be archived between writes and a later read looks like data loss.
     #[test]
-    fn test_deactivate_service_preserves_ttl() {
+    fn test_update_reputation_extends_ttl_on_all_touched_keys() {
         let env = Env::default();
         env.mock_all_auths();
-        let (registry, _agents) = deploy_registry(&env);
-        let provider = Address::generate(&env);
-        let id = registry.register_service(
-            &provider,
-            &String::from_str(&env, "Test Service"),
-            &String::from_str(&env, "Test Description"),
-            &String::from_str(&env, "https://test.com"),
-            &String::from_str(&env, "10"),
-            &String::from_str(&env, "G_TEST_PAYMENT"),
-            &String::from_str(&env, "compute"),
-        );
+        let (registry, agents) = deploy_registry(&env);
+        let id = register_a_service(&env, &registry);
+        let agent = Address::generate(&env);
+        agents.set_registered(&agent, &true);
 
-        // Advance ledger by somewhat less than MAX_TTL
-        env.ledger().with_mut(|li| li.sequence_number += 3110400 - 100);
-        
-        // This should bump the TTL again
-        registry.deactivate_service(&provider, &id);
+        // Advance to just before the original TTL would expire.
+        env.ledger()
+            .with_mut(|li| li.sequence_number += MAX_TTL - 1);
 
-        // Advance ledger past the original threshold.
-        // If TTL was not bumped during deactivate_service, this would archive it
-        // and retrieving the service entry would fail or return an archived state.
-        env.ledger().with_mut(|li| li.sequence_number += 150);
+        // This vote must bump DataKey::AgentsContract, DataKey::Service(id),
+        // and DataKey::LastVote(id, agent).
+        registry.update_reputation(&id, &true, &agent);
+        assert_eq!(registry.get_service(&id).reputation, 1);
 
-        // Assert readability
+        // Advance past the original registration TTL. Without the extend_ttl
+        // calls the entries would now be archived and the next read would fail.
+        env.ledger().with_mut(|li| li.sequence_number += 2);
+
+        // The service entry must still be readable after the original TTL window.
         let entry = registry.get_service(&id);
-        assert_eq!(entry.active, false);
+        assert_eq!(entry.id, id);
+        assert_eq!(entry.reputation, 1);
+
+        // The agents contract trust anchor must still be readable too.
+        assert!(registry.get_agents_contract().is_some());
     }
 
     #[test]
@@ -1951,6 +2068,155 @@ mod test {
             .with_mut(|li| li.sequence_number += VOTE_COOLDOWN_LEDGERS as u32 + 1);
         registry.update_reputation(&1u64, &false, &agent);
         assert_eq!(registry.get_service(&1u64).reputation, MIN_REPUTATION);
+    }
+
+    // ── update_reputation boundary tests (#736) ───────────────────────────
+    //
+    // Each table below pins one value on each side of a threshold where
+    // update_reputation changes behaviour. Every test uses a single Env so it
+    // records exactly one snapshot under test_snapshots/test/, making changes
+    // to storage writes, events or auth trees visible in review.
+
+    #[test]
+    fn test_update_reputation_boundaries_around_clamps() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (registry_id, registry, agents) = deploy_registry_with_id(&env);
+        let provider = Address::generate(&env);
+
+        // (starting reputation, positive vote, expected reputation)
+        let cases = [
+            // Upper clamp at MAX_REPUTATION.
+            (MAX_REPUTATION - 2, true, MAX_REPUTATION - 1),
+            (MAX_REPUTATION - 1, true, MAX_REPUTATION),
+            (MAX_REPUTATION, true, MAX_REPUTATION),
+            (MAX_REPUTATION, false, MAX_REPUTATION - 1),
+            // Lower clamp at MIN_REPUTATION.
+            (MIN_REPUTATION + 2, false, MIN_REPUTATION + 1),
+            (MIN_REPUTATION + 1, false, MIN_REPUTATION),
+            (MIN_REPUTATION, false, MIN_REPUTATION),
+            (MIN_REPUTATION, true, MIN_REPUTATION + 1),
+            // Zero, where the sign flips.
+            (-1, true, 0),
+            (0, true, 1),
+            (0, false, -1),
+            (1, false, 0),
+        ];
+
+        for (i, (start, positive, expected)) in cases.iter().enumerate() {
+            // A fresh service and agent per case keeps the cooldown out of play.
+            let id = i as u64 + 1;
+            env.clone().as_contract(&registry_id, || {
+                setup_service(&env, id, &provider, "compute", *start, true);
+            });
+            let agent = Address::generate(&env);
+            agents.set_registered(&agent, &true);
+
+            registry.update_reputation(&id, positive, &agent);
+            assert_eq!(
+                registry.get_service(&id).reputation,
+                *expected,
+                "start={} positive={}",
+                start,
+                positive
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_reputation_cooldown_boundary() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (registry_id, registry, agents) = deploy_registry_with_id(&env);
+        let provider = Address::generate(&env);
+        let agent = Address::generate(&env);
+        agents.set_registered(&agent, &true);
+
+        let cooldown = VOTE_COOLDOWN_LEDGERS as u32;
+        // (ledgers elapsed since the previous vote, second vote accepted)
+        let cases = [
+            (0, false),
+            (1, false),
+            (cooldown - 1, false),
+            (cooldown, true),
+            (cooldown + 1, true),
+        ];
+
+        // Ledger 0 covers a first vote at the lowest possible sequence; the
+        // second base covers a vote recorded at a non-zero sequence.
+        let mut next_id = 1u64;
+        for base in [0u32, 1_000] {
+            env.ledger().with_mut(|li| li.sequence_number = base);
+
+            // One service per case so each has its own LastVote entry, all
+            // first voted on at `base`.
+            let first_id = next_id;
+            for _ in cases.iter() {
+                env.clone().as_contract(&registry_id, || {
+                    setup_service(&env, next_id, &provider, "compute", 0, true);
+                });
+                registry.update_reputation(&next_id, &true, &agent);
+                next_id += 1;
+            }
+
+            for (i, (elapsed, accepted)) in cases.iter().enumerate() {
+                let id = first_id + i as u64;
+                env.ledger()
+                    .with_mut(|li| li.sequence_number = base + elapsed);
+
+                let result = registry.try_update_reputation(&id, &true, &agent);
+                if *accepted {
+                    assert_eq!(result, Ok(Ok(())), "base={} elapsed={}", base, elapsed);
+                    assert_eq!(registry.get_service(&id).reputation, 2);
+                } else {
+                    assert_eq!(
+                        result,
+                        Err(Ok(RegistryError::ReputationVoteCooldown)),
+                        "base={} elapsed={}",
+                        base,
+                        elapsed
+                    );
+                    assert_eq!(registry.get_service(&id).reputation, 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_update_reputation_service_id_boundaries() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (registry, agents) = deploy_registry(&env);
+        let agent = Address::generate(&env);
+        agents.set_registered(&agent, &true);
+
+        // Empty registry: no id is votable, including the extremes.
+        for id in [0u64, 1, u64::MAX] {
+            assert_eq!(
+                registry.try_update_reputation(&id, &true, &agent),
+                Err(Ok(RegistryError::ServiceNotFound)),
+                "empty registry, id={}",
+                id
+            );
+        }
+
+        // Ids are assigned from 1, so 0 and last + 1 sit either side of the
+        // valid range.
+        let id = register_a_service(&env, &registry);
+        assert_eq!(id, 1);
+        for missing in [0u64, id + 1, u64::MAX] {
+            assert_eq!(
+                registry.try_update_reputation(&missing, &true, &agent),
+                Err(Ok(RegistryError::ServiceNotFound)),
+                "id={}",
+                missing
+            );
+        }
+        assert_eq!(
+            registry.try_update_reputation(&id, &true, &agent),
+            Ok(Ok(()))
+        );
+        assert_eq!(registry.get_service(&id).reputation, 1);
     }
 
     // ── register_service input validation tests ───────────────────────────
@@ -2339,6 +2605,104 @@ mod test {
         assert_eq!(max, MAX_REPUTATION);
     }
 
+    // ── get_reputation_bounds boundary tests (#742) ──────────────────────
+    //
+    // `get_reputation_bounds` takes no input and returns the (MIN, MAX) pair
+    // that `update_reputation` clamps to, so the "boundaries" are the returned
+    // values themselves. The table below pins one value on each side of every
+    // threshold (MIN-1/MIN/MIN+1, the sign flip at -1/0/1, MAX-1/MAX/MAX+1,
+    // plus the i32 extremes). Each test uses a single Env so it records
+    // exactly one snapshot under test_snapshots/test/.
+    #[test]
+    fn test_get_reputation_bounds_boundaries() {
+        let env = Env::default();
+        let registry_id = env.register(LodestarRegistry, (Address::generate(&env),));
+        let registry = LodestarRegistryClient::new(&env, &registry_id);
+
+        let (min, max) = registry.get_reputation_bounds();
+        assert_eq!(min, MIN_REPUTATION);
+        assert_eq!(max, MAX_REPUTATION);
+        assert!(min < max, "lower bound must sit below the upper bound");
+        assert!(
+            min < 0 && 0 < max,
+            "zero must fall strictly inside the bounds"
+        );
+        assert_eq!(max - min, 20_000, "bound width must stay 20,000");
+        assert_eq!(min, -max, "bounds must stay symmetric around zero");
+        // A +/-1 vote from any in-bounds reputation must stay representable:
+        // the clamps sit strictly inside the i32 extremes.
+        assert!(min > i32::MIN && max < i32::MAX);
+
+        // (probe value, below_min, within_inclusive, above_max)
+        let cases: [(i32, bool, bool, bool); 11] = [
+            (MIN_REPUTATION - 1, true, false, false),
+            (MIN_REPUTATION, false, true, false),
+            (MIN_REPUTATION + 1, false, true, false),
+            (-1, false, true, false),
+            (0, false, true, false),
+            (1, false, true, false),
+            (MAX_REPUTATION - 1, false, true, false),
+            (MAX_REPUTATION, false, true, false),
+            (MAX_REPUTATION + 1, false, false, true),
+            (i32::MIN, true, false, false),
+            (i32::MAX, false, false, true),
+        ];
+
+        for (value, below, within, above) in cases {
+            assert_eq!(value < min, below, "below_min mismatch for {}", value);
+            assert_eq!(
+                value >= min && value <= max,
+                within,
+                "within mismatch for {}",
+                value
+            );
+            assert_eq!(value > max, above, "above_max mismatch for {}", value);
+        }
+    }
+
+    // Empty registry vs registry holding entries parked exactly on the clamps
+    // (the "empty and maximum collection cases" for a getter with no input):
+    // the reported bounds must be identical in both states, and the
+    // `update_reputation` clamp must agree with them so an off-by-one cannot
+    // ship as a permanent on-chain constant.
+    #[test]
+    fn test_get_reputation_bounds_stable_across_registry_states() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (registry_id, registry, agents) = deploy_registry_with_id(&env);
+
+        // Empty registry: bounds are still the compile-time constants.
+        assert_eq!(
+            registry.get_reputation_bounds(),
+            (MIN_REPUTATION, MAX_REPUTATION)
+        );
+
+        // Seed entries parked exactly on each clamp (maximum collection case:
+        // reputations sitting on the boundary values themselves).
+        let provider = Address::generate(&env);
+        env.clone().as_contract(&registry_id, || {
+            setup_service(&env, 1, &provider, "compute", MIN_REPUTATION, true);
+            setup_service(&env, 2, &provider, "compute", MAX_REPUTATION, true);
+            setup_service(&env, 3, &provider, "compute", 0, true);
+        });
+
+        let (min, max) = registry.get_reputation_bounds();
+        assert_eq!((min, max), (MIN_REPUTATION, MAX_REPUTATION));
+
+        // The clamp honours the reported bounds on both sides.
+        let agent = Address::generate(&env);
+        agents.set_registered(&agent, &true);
+        registry.update_reputation(&2u64, &true, &agent);
+        assert_eq!(registry.get_service(&2u64).reputation, max);
+        env.ledger()
+            .with_mut(|li| li.sequence_number += VOTE_COOLDOWN_LEDGERS as u32 + 1);
+        registry.update_reputation(&1u64, &false, &agent);
+        assert_eq!(registry.get_service(&1u64).reputation, min);
+
+        // Bounds are unchanged after the votes above.
+        assert_eq!(registry.get_reputation_bounds(), (min, max));
+    }
+
     // ── TTL extension tests for list_services / list_services_page (#733) ────
     //
     // Every persistent storage key read by a listing function must have its TTL
@@ -2425,8 +2789,7 @@ mod test {
 
         // This read must bump DataKey::ServiceIdsByCategory("weather") and
         // DataKey::Service(id).
-        let page1 =
-            registry.list_services(&0, &20, &Some(String::from_str(&env, "weather")));
+        let page1 = registry.list_services(&0, &20, &Some(String::from_str(&env, "weather")));
         assert_eq!(page1.len(), 1, "service must be visible before TTL lapses");
         assert_eq!(page1.get(0).unwrap().id, id);
 
@@ -2434,8 +2797,7 @@ mod test {
         env.ledger().with_mut(|li| li.sequence_number += 2);
 
         // Both keys were bumped — the service must still be listed.
-        let page2 =
-            registry.list_services(&0, &20, &Some(String::from_str(&env, "weather")));
+        let page2 = registry.list_services(&0, &20, &Some(String::from_str(&env, "weather")));
         assert_eq!(
             page2.len(),
             1,
@@ -2486,5 +2848,91 @@ mod test {
              extend_ttl was not called on all keys touched by list_services_page"
         );
         assert_eq!(page2.get(0).unwrap().id, id);
+    }
+
+    // ── get_agents_contract authorization posture ─────────────────────────────
+    //
+    // `get_agents_contract` takes no `Address` argument and calls no `require_auth`, so
+    // it is a permissionless read. The tests below pin that posture from both
+    // sides: the read must keep working for a caller who signs nothing, and it
+    // must keep working for a caller whose signature comes from an address with
+    // no relationship to the registry. A future refactor that adds a hidden auth
+    // requirement (or drops a state write into a read path) fails here.
+
+    #[test]
+    fn test_get_agents_contract_succeeds_with_no_auths() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let agents_id = env.register(MockAgents, ());
+        let registry_id = env.register(LodestarRegistry, (agents_id.clone(),));
+        let registry = LodestarRegistryClient::new(&env, &registry_id);
+
+        // Drop every auth mock, so nothing is left to authorise the read with.
+        env.set_auths(&[]);
+
+        let result = registry.get_agents_contract();
+        assert_eq!(result, Some(agents_id));
+
+        // A read that demands no authorization must not consume any either.
+        assert!(
+            env.auths().is_empty(),
+            "get_agents_contract must not require or record an authorization",
+        );
+    }
+
+    #[test]
+    fn test_get_agents_contract_succeeds_for_any_signer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let agents_id = env.register(MockAgents, ());
+        let registry_id = env.register(LodestarRegistry, (agents_id.clone(),));
+        let registry = LodestarRegistryClient::new(&env, &registry_id);
+
+        // The anonymous read, with no auths available at all.
+        env.set_auths(&[]);
+        let anonymous = registry.get_agents_contract();
+        assert_eq!(anonymous, Some(agents_id.clone()));
+
+        // The same read signed by an address that is neither the provider nor
+        // anything the registry knows about.
+        let stranger = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &registry_id,
+                fn_name: "get_agents_contract",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let signed_by_stranger = registry.get_agents_contract();
+        assert_eq!(signed_by_stranger, Some(agents_id));
+    }
+
+    #[test]
+    fn test_get_agents_contract_extends_ttl() {
+        let env = Env::default();
+        let agents_id = env.register(MockAgents, ());
+        let registry_id = env.register(LodestarRegistry, (agents_id.clone(),));
+        let registry = LodestarRegistryClient::new(&env, &registry_id);
+
+        // Advance to just before the constructor's TTL expires.
+        env.ledger().with_mut(|li| li.sequence_number += MAX_TTL - 1);
+
+        // Call the read endpoint; this must bump the TTL.
+        let contract = registry.get_agents_contract();
+        assert_eq!(contract, Some(agents_id.clone()));
+
+        // Advance past the original expiration boundary.
+        env.ledger().with_mut(|li| li.sequence_number += 2);
+
+        // If the read did not bump the TTL, the entry is archived and this fails.
+        let contract_after = registry.get_agents_contract();
+        assert_eq!(
+            contract_after,
+            Some(agents_id.clone()),
+            "agents contract must still be readable after original TTL window: \
+             extend_ttl was not called on the touched key"
+        );
     }
 }
