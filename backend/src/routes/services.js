@@ -8,6 +8,7 @@ import { recordPaymentOnChain, getAgent } from '../lib/contract.js';
 import { usdcToStroops } from '../lib/stroops.js';
 import { isValidStellarAddress } from '../middleware/addressValidator.js';
 import { createRateLimiter } from '../middleware/rateLimiter.js';
+import { validateWeatherRequest } from './servicesSchemas.js';
 
 const router = Router();
 
@@ -113,13 +114,20 @@ router.use(
 
 router.get('/weather', async (req, res) => {
   try {
-    const lat = parseFloat(req.query.lat) || 40.7128;
-    const lon = parseFloat(req.query.lon) || -74.006;
-
-    if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
-      logger.warn({ lat, lon }, 'Invalid coordinates supplied to GET /demo/weather');
-      return res.status(400).json({ error: 'Coordinates out of range', code: 'INVALID_COORDINATES' });
+    // The schema is the route boundary (#675): a malformed request is a 400
+    // with a catalogued code, and it never reaches the upstream provider or
+    // the contract layer.
+    const validation = validateWeatherRequest(req);
+    if (!validation.ok) {
+      logger.warn(
+        { field: validation.field, code: validation.code },
+        'Invalid request supplied to GET /demo/weather'
+      );
+      return res.status(validation.status).json({ error: validation.error, code: validation.code });
     }
+
+    const lat = validation.data.query.lat ?? 40.7128;
+    const lon = validation.data.query.lon ?? -74.006;
 
     const url =
       `https://api.open-meteo.com/v1/forecast` +
@@ -153,7 +161,7 @@ router.get('/weather', async (req, res) => {
       service: 'Lodestar Weather Service',
       amount: config.x402.weatherPrice,
       txHash,
-      ...(req.query.demoRunId && { demoRunId: String(req.query.demoRunId) }),
+      ...(validation.data.query.demoRunId && { demoRunId: validation.data.query.demoRunId }),
     });
 
     if (agentAddress && config.contract.agentsId) {
