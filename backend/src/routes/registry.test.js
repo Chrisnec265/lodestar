@@ -42,8 +42,29 @@ vi.mock('../lib/reputationHistory.js', () => ({
   getReputationHistory: (...args) => mockGetReputationHistory(...args),
 }));
 
+// A pino-like stand-in: `child()` returns a logger that remembers the
+// bindings it was created with, and every line it emits is recorded so the
+// structured log context of a route can be asserted (#670).
+const mockLogLines = [];
+
+function createMockLogger(bindings = {}) {
+  const record = (level) => (obj, msg) => {
+    // Pino merges the child bindings into every line, so the mock does too.
+    mockLogLines.push({ level, ...bindings, ...(obj ?? {}), bindings, msg });
+  };
+  return {
+    error: record('error'),
+    info: record('info'),
+    warn: record('warn'),
+    debug: record('debug'),
+    child: vi.fn((extra) => createMockLogger({ ...bindings, ...extra })),
+  };
+}
+
+const mockLogger = createMockLogger();
+
 vi.mock('../lib/logger.js', () => ({
-  default: { error: vi.fn(), info: vi.fn(), warn: vi.fn() },
+  default: mockLogger,
 }));
 
 // Rate limiting is verified in isolation in middleware/rateLimiter.test.js;
@@ -780,6 +801,87 @@ describe('POST /api/reputation/:id — authorization', () => {
 
     expect(res.status).toBe(500);
     expect(res.body.code).toBe('UPDATE_ERROR');
+  });
+});
+
+describe('POST /api/reputation/:id — structured log context (#670)', () => {
+  const VALID_AGENT = 'GAMASX3TLJIDO42FO3GTX7IQAYN7RJ4U4CXJOROTB7RSV3NGPUEIEQH3';
+  let logApp;
+
+  beforeAll(async () => {
+    const router = (await import('./registry.js')).default;
+    const requestIdMiddleware = (await import('../lib/requestId.js')).default;
+    logApp = express();
+    logApp.use(express.json());
+    logApp.use(requestIdMiddleware);
+    logApp.use('/api', router);
+  });
+
+  beforeEach(() => {
+    mockLogLines.length = 0;
+    mockIsAllowedReputationAgent.mockReset();
+    mockUpdateReputation.mockReset();
+  });
+
+  it('emits one structured line per request with duration, outcome and the request id', async () => {
+    mockIsAllowedReputationAgent.mockReturnValue(true);
+    mockUpdateReputation.mockResolvedValueOnce(7);
+
+    const res = await request(logApp)
+      .post('/api/reputation/1')
+      .send({ positive: true, agent: VALID_AGENT });
+
+    expect(res.status).toBe(200);
+    expect(mockLogLines).toHaveLength(1);
+
+    const [line] = mockLogLines;
+    expect(line.level).toBe('info');
+    expect(line.outcome).toBe('updated');
+    expect(typeof line.durationMs).toBe('number');
+    expect(line.durationMs).toBeGreaterThanOrEqual(0);
+    expect(line.serviceId).toBe(1);
+    expect(line.agent).toBe(VALID_AGENT);
+    // The request id is bound to the child logger, so it is on the line
+    // itself and on every line the request emits.
+    expect(line.bindings.requestId).toBe(res.headers['x-request-id']);
+    expect(line.requestId).toBe(res.headers['x-request-id']);
+  });
+
+  it('logs a rejected vote without the request body', async () => {
+    const res = await request(logApp)
+      .post('/api/reputation/1')
+      .send({ positive: 'yes', agent: VALID_AGENT });
+
+    expect(res.status).toBe(400);
+    expect(mockLogLines).toHaveLength(1);
+
+    const [line] = mockLogLines;
+    expect(line.level).toBe('warn');
+    expect(line.outcome).toBe('rejected');
+    expect(line.durationMs).toBeGreaterThanOrEqual(0);
+    expect(line.bindings.requestId).toBe(res.headers['x-request-id']);
+    // Neither the body nor its content is logged.
+    expect(line).not.toHaveProperty('body');
+    expect(JSON.stringify(line)).not.toContain('yes');
+    expect(mockUpdateReputation).not.toHaveBeenCalled();
+  });
+
+  it('logs a failed vote with the error and the duration', async () => {
+    mockIsAllowedReputationAgent.mockReturnValue(true);
+    mockUpdateReputation.mockRejectedValueOnce(new Error('boom'));
+
+    const res = await request(logApp)
+      .post('/api/reputation/1')
+      .send({ positive: true, agent: VALID_AGENT });
+
+    expect(res.status).toBe(500);
+    expect(mockLogLines).toHaveLength(1);
+
+    const [line] = mockLogLines;
+    expect(line.level).toBe('error');
+    expect(line.outcome).toBe('failed');
+    expect(line.durationMs).toBeGreaterThanOrEqual(0);
+    expect(line.bindings.requestId).toBe(res.headers['x-request-id']);
   });
 });
 
