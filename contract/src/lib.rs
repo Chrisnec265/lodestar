@@ -36,8 +36,7 @@ pub enum RegistryError {
 // re-register under a canonical category returned by `list_categories()`.
 const VALID_CATEGORIES: &[&str] = &["search", "weather", "finance", "ai", "data", "compute"];
 
-// Returns the canonical lower-case form for a user-supplied category string,
-// or `None` if it is not one of the known categories.
+
 fn canonicalize_category(env: &Env, category: &String) -> Option<String> {
     let len = category.len() as usize;
     if len > 32 {
